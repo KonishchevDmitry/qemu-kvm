@@ -571,11 +571,12 @@ static int img_convert(int argc, char **argv)
     int progress = 0;
     const char *fmt, *out_fmt, *out_baseimg, *out_filename;
     BlockDriver *drv, *proto_drv;
-    BlockDriverState **bs = NULL, *out_bs = NULL;
+    BlockDriverState **bs = NULL, *out_bs = NULL, *out_bf = NULL;
     int64_t total_sectors, nb_sectors, sector_num, bs_offset;
-    uint64_t bs_sectors;
+    uint64_t bf_sectors, bs_sectors;
     uint8_t * buf = NULL;
     const uint8_t *buf1;
+    uint8_t * bf_buf = NULL;
     BlockDriverInfo bdi;
     QEMUOptionParameter *param = NULL, *create_options = NULL;
     QEMUOptionParameter *out_baseimg_param;
@@ -657,7 +658,6 @@ static int img_convert(int argc, char **argv)
     for (bs_i = 0; bs_i < bs_n; bs_i++) {
         bs[bs_i] = bdrv_new_open(argv[optind + bs_i], fmt, BDRV_O_FLAGS);
         if (!bs[bs_i]) {
-            error_report("Could not open '%s'", argv[optind + bs_i]);
             ret = -1;
             goto out;
         }
@@ -719,6 +719,16 @@ static int img_convert(int argc, char **argv)
     out_baseimg_param = get_option_parameter(param, BLOCK_OPT_BACKING_FILE);
     if (out_baseimg_param) {
         out_baseimg = out_baseimg_param->value.s;
+
+        /* out_baseimg_parm != NULL even if there is no base img specified! */
+        if (out_baseimg) {
+            out_bf = bdrv_new_open(out_baseimg, NULL, BDRV_O_FLAGS);
+            if (!out_bf) {
+                ret = -1;
+                goto out;
+            }
+            bdrv_get_geometry(out_bf, &bf_sectors);
+        }
     }
 
     /* Check if compression is supported */
@@ -767,6 +777,9 @@ static int img_convert(int argc, char **argv)
     bs_offset = 0;
     bdrv_get_geometry(bs[0], &bs_sectors);
     buf = qemu_malloc(IO_BUF_SIZE);
+    if (out_baseimg) {
+        bf_buf = qemu_malloc(IO_BUF_SIZE);
+    }
 
     if (compress) {
         ret = bdrv_get_info(out_bs, &bdi);
@@ -884,13 +897,21 @@ static int img_convert(int argc, char **argv)
             }
 
             if (has_zero_init) {
-                /* If the output image is being created as a copy on write image,
-                   assume that sectors which are unallocated in the input image
-                   are present in both the output's and input's base images (no
-                   need to copy them). */
-                if (out_baseimg) {
-                    if (!bdrv_is_allocated(bs[bs_i], sector_num - bs_offset,
-                                           n, &n1)) {
+                /* Comparing the sectors with the same sectors in the backing file. */
+                if (out_baseimg && sector_num < bf_sectors) {
+                    n = MIN(n, bf_sectors - sector_num);
+
+                    ret = bdrv_read(bs[bs_i], sector_num - bs_offset, buf, n);
+                    if (ret < 0) {
+                        error_report("error while reading input file");
+                        goto out;
+                    }
+                    ret = bdrv_read(out_bf, sector_num - bs_offset, bf_buf, n);
+                    if (ret < 0) {
+                        error_report("error while reading backing file");
+                        goto out;
+                    }
+                    if (!compare_sectors(buf, bf_buf, n, &n1)) {
                         sector_num += n1;
                         continue;
                     }
@@ -919,8 +940,7 @@ static int img_convert(int argc, char **argv)
                    If the output is to a host device, we also write out
                    sectors that are entirely 0, since whatever data was
                    already there is garbage, not 0s. */
-                if (!has_zero_init || out_baseimg ||
-                    is_allocated_sectors(buf1, n, &n1)) {
+                if (!has_zero_init || is_allocated_sectors(buf1, n, &n1)) {
                     ret = bdrv_write(out_bs, sector_num, buf1, n1);
                     if (ret < 0) {
                         error_report("error while writing");
@@ -939,8 +959,12 @@ out:
     free_option_parameters(create_options);
     free_option_parameters(param);
     qemu_free(buf);
+    qemu_free(bf_buf);
     if (out_bs) {
         bdrv_delete(out_bs);
+    }
+    if (out_bf) {
+        bdrv_delete(out_bf);
     }
     if (bs) {
         for (bs_i = 0; bs_i < bs_n; bs_i++) {
