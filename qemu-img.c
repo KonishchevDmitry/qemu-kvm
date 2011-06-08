@@ -38,6 +38,8 @@ typedef struct img_cmd_t {
     int (*handler)(int argc, char **argv);
 } img_cmd_t;
 
+static const int SECTOR_SIZE = 512;
+
 /* Default to cache=writeback as data integrity is not important for qemu-tcg. */
 #define BDRV_O_FLAGS BDRV_O_CACHE_WB
 
@@ -531,7 +533,7 @@ static int is_not_zero(const uint8_t *sector, int len)
 }
 
 /*
- * Returns true iff the first sector pointed to by 'buf' contains at least
+ * Returns true if the first sector pointed to by 'buf' contains at least
  * a non-NUL byte.
  *
  * 'pnum' is set to the number of sectors (including and immediately following
@@ -590,15 +592,15 @@ static int compare_sectors(const uint8_t *buf1, const uint8_t *buf2, int n,
 
 static int img_convert(int argc, char **argv)
 {
-    int c, ret = 0, n, n1, bs_n, bs_i, compress, cluster_size, cluster_sectors;
+    int c, ret = 0, n, cur_n, bs_n, bs_i, compress, cluster_size, cluster_sectors;
     int progress = 0;
     const char *fmt, *out_fmt, *out_baseimg, *out_filename;
     BlockDriver *drv, *proto_drv;
     BlockDriverState **bs = NULL, *out_bs = NULL;
     int64_t total_sectors, nb_sectors, sector_num, bs_offset;
     uint64_t bs_sectors;
+    uint64_t *bs_geometry = NULL;
     uint8_t * buf = NULL;
-    const uint8_t *buf1;
     BlockDriverInfo bdi;
     QEMUOptionParameter *param = NULL, *create_options = NULL;
     QEMUOptionParameter *out_baseimg_param;
@@ -874,14 +876,21 @@ static int img_convert(int argc, char **argv)
         /* signal EOF to align */
         bdrv_write_compressed(out_bs, 0, NULL, 0);
     } else {
+        int backing_depth;
+        int bs_i_prev = -1;
+        float progress = 100;
+        BlockDriverState *cur_bs;
         int has_zero_init = bdrv_has_zero_init(out_bs);
 
         sector_num = 0; // total number of sectors converted so far
         nb_sectors = total_sectors - sector_num;
-        local_progress = (float)100 /
-            (nb_sectors / MIN(nb_sectors, IO_BUF_SIZE / 512));
 
         for(;;) {
+            if (total_sectors) {
+                progress = (long double) sector_num / total_sectors * 100;
+            }
+            qemu_progress_print(progress, 0);
+
             nb_sectors = total_sectors - sector_num;
             if (nb_sectors <= 0) {
                 break;
@@ -893,13 +902,36 @@ static int img_convert(int argc, char **argv)
             }
 
             while (sector_num - bs_offset >= bs_sectors) {
-                bs_i ++;
-                assert (bs_i < bs_n);
+                bs_i++;
+                assert(bs_i < bs_n);
                 bs_offset += bs_sectors;
                 bdrv_get_geometry(bs[bs_i], &bs_sectors);
+
                 /* printf("changing part: sector_num=%" PRId64 ", bs_i=%d, "
                   "bs_offset=%" PRId64 ", bs_sectors=%" PRId64 "\n",
                    sector_num, bs_i, bs_offset, bs_sectors); */
+            }
+
+            if (bs_i != bs_i_prev) {
+                /* Getting geometry of the image and all its backing images */
+
+                backing_depth = 1;
+                cur_bs = bs[bs_i];
+                while (( cur_bs = cur_bs->backing_hd )) {
+                    backing_depth++;
+                }
+
+                bs_geometry = (uint64_t *) qemu_realloc(
+                    bs_geometry, backing_depth * sizeof(uint64_t));
+
+                backing_depth = 1;
+                cur_bs = bs[bs_i];
+                *bs_geometry = bs_sectors;
+                while (( cur_bs = cur_bs->backing_hd )) {
+                    bdrv_get_geometry(cur_bs, bs_geometry + backing_depth++);
+                }
+
+                bs_i_prev = bs_i;
             }
 
             if (n > bs_offset + bs_sectors - sector_num) {
@@ -912,55 +944,109 @@ static int img_convert(int argc, char **argv)
                    are present in both the output's and input's base images (no
                    need to copy them). */
                 if (out_baseimg) {
-                    if (!bdrv_is_allocated(bs[bs_i], sector_num - bs_offset,
-                                           n, &n1)) {
-                        sector_num += n1;
+                    if (!bdrv_is_allocated(bs[bs_i], sector_num - bs_offset, n, &cur_n)) {
+                        sector_num += cur_n;
                         continue;
                     }
-                    /* The next 'n1' sectors are allocated in the input image. Copy
+                    /* The next 'cur_n' sectors are allocated in the input image. Copy
                        only those as they may be followed by unallocated sectors. */
-                    n = n1;
+                    n = cur_n;
                 }
+            }
+
+            /* If the output image is being created as a copy on write image,
+               copy all sectors even the ones containing only zero bytes,
+               because they may differ from the sectors in the base image.
+
+               If the output is to a host device, we also write out
+               sectors that are entirely 0, since whatever data was
+               already there is garbage, not 0s. */
+            if (!has_zero_init || out_baseimg) {
+                ret = bdrv_read(bs[bs_i], sector_num - bs_offset, buf, n);
+                if (ret < 0) {
+                    error_report("error while reading");
+                    goto out;
+                }
+
+                ret = bdrv_write(out_bs, sector_num, buf, n);
+                if (ret < 0) {
+                    error_report("error while writing");
+                    goto out;
+                }
+
+                sector_num += n;
             } else {
-                n1 = n;
-            }
+                /* Look for the sectors in the image and if they are not
+                   allocated - sequentially in all its backing images.
 
-            ret = bdrv_read(bs[bs_i], sector_num - bs_offset, buf, n);
-            if (ret < 0) {
-                error_report("error while reading");
-                goto out;
-            }
-            /* NOTE: at the same time we convert, we do not write zero
-               sectors to have a chance to compress the image. Ideally, we
-               should add a specific call to have the info to go faster */
-            buf1 = buf;
-            while (n > 0) {
-                /* If the output image is being created as a copy on write image,
-                   copy all sectors even the ones containing only NUL bytes,
-                   because they may differ from the sectors in the base image.
+                   Write only non-zero bytes to the output image. */
 
-                   If the output is to a host device, we also write out
-                   sectors that are entirely 0, since whatever data was
-                   already there is garbage, not 0s. */
-                if (!has_zero_init || out_baseimg ||
-                    is_allocated_sectors(buf1, n, &n1)) {
-                    ret = bdrv_write(out_bs, sector_num, buf1, n1);
-                    if (ret < 0) {
-                        error_report("error while writing");
-                        goto out;
+                uint64_t cur_sectors;
+                uint64_t bs_sector;
+                int allocated_num;
+                int sector_found;
+
+                while (n > 0) {
+                    cur_bs = bs[bs_i];
+                    bs_sector = sector_num - bs_offset;
+                    backing_depth = 0;
+                    sector_found = 0;
+
+                    do {
+                        cur_sectors = bs_geometry[backing_depth++];
+
+                        if (bs_sector >= cur_sectors) {
+                            continue;
+                        }
+
+                        if (bs_sector + n <= cur_sectors) {
+                            cur_n = n;
+                        } else {
+                            cur_n = cur_sectors - bs_sector;
+                        }
+
+                        if (bdrv_is_allocated(cur_bs, bs_sector, cur_n, &allocated_num)) {
+                            const uint8_t *cur_buf = buf;
+                            sector_found = 1;
+
+                            ret = bdrv_read(cur_bs, bs_sector, buf, allocated_num);
+                            if (ret < 0) {
+                                error_report("error while reading");
+                                goto out;
+                            }
+
+                            while (allocated_num > 0) {
+                                if (is_allocated_sectors(cur_buf, allocated_num, &cur_n)) {
+                                    ret = bdrv_write(out_bs, sector_num, cur_buf, cur_n);
+                                    if (ret < 0) {
+                                        error_report("error while writing");
+                                        goto out;
+                                    }
+                                }
+
+                                n -= cur_n;
+                                sector_num += cur_n;
+                                allocated_num -= cur_n;
+                                cur_buf += cur_n * SECTOR_SIZE;
+                            }
+
+                            break;
+                        }
+                    } while(( cur_bs = cur_bs->backing_hd ));
+
+                    if (!sector_found) {
+                        sector_num++;
+                        n--;
                     }
                 }
-                sector_num += n1;
-                n -= n1;
-                buf1 += n1 * 512;
             }
-            qemu_progress_print(local_progress, 100);
         }
     }
 out:
     qemu_progress_end();
     free_option_parameters(create_options);
     free_option_parameters(param);
+    qemu_free(bs_geometry);
     qemu_free(buf);
     if (out_bs) {
         bdrv_delete(out_bs);
